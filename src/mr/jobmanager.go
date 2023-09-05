@@ -8,18 +8,20 @@ import (
 )
 
 type JobManager struct {
-	jobchan     chan *Job
-	jobs        map[JobId]*Job
-	lk          sync.RWMutex
-	expire_time time.Duration
+	jobchan      chan *Job
+	jobs         map[JobId]*Job
+	lk           sync.RWMutex
+	expire_time  time.Duration
+	check_interv time.Duration
 }
 
 func NewJobManager(size int) (jm *JobManager) {
 	jm = &JobManager{
-		jobchan:     make(chan *Job, size),
-		jobs:        make(map[JobId]*Job, size),
-		lk:          sync.RWMutex{},
-		expire_time: 10 * time.Second,
+		jobchan:      make(chan *Job, size),
+		jobs:         make(map[JobId]*Job, size),
+		lk:           sync.RWMutex{},
+		expire_time:  10 * time.Second,
+		check_interv: 2 * time.Second,
 	}
 
 	go jm.ExpireChecker()
@@ -96,7 +98,7 @@ func (jm *JobManager) ExpireChecker() {
 	}
 
 	for {
-		time.Sleep(2 * time.Second)
+		time.Sleep(jm.check_interv)
 
 		jm.lk.Lock()
 

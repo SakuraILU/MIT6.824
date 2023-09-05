@@ -1,10 +1,14 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io/ioutil"
 	"log"
 	"net/rpc"
+	"os"
+	"strconv"
 	"time"
 )
 
@@ -28,17 +32,65 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// Your worker implementation here.
 	for {
-		args := ExampleArgs{}
-		reply := Job{}
-		if call("Master.GetJob", &args, &reply) == false {
-			time.Sleep(3 * time.Second)
+		args := &ExampleArgs{}
+		job := &Job{}
+		if call("Master.GetJob", args, job) == false {
+			time.Sleep(2 * time.Second)
+			continue
 		}
 
-		fmt.Printf("Get job: map %s", reply)
+		switch job.Type {
+		case MAP:
+			DoMapf(mapf, job)
+		}
+
+		reply := &ExampleReply{}
+		if call("Master.JobDone", job, reply) == false {
+			log.Printf("job %v may be already finished by others", job.Id)
+			time.Sleep(2 * time.Second)
+			continue
+		}
 	}
 	// uncomment to send the Example RPC to the master.
 	// CallExample()
 
+}
+
+func DoMapf(mapf func(string, string) []KeyValue, job *Job) {
+	kvas := make([]KeyValue, 0)
+	for _, filename := range job.Filename {
+		file, err := os.Open(filename)
+		if err != nil {
+			log.Fatalf("cannot open %v", filename)
+		}
+		content, err := ioutil.ReadAll(file)
+		if err != nil {
+			log.Fatalf("cannot read %v", filename)
+		}
+		file.Close()
+		kvas = append(kvas, mapf(filename, string(content))...)
+	}
+
+	intermediates := make([][]KeyValue, job.NReduce)
+
+	for _, kva := range kvas {
+		idx := ihash(kva.Key) % job.NReduce
+		intermediates[idx] = append(intermediates[idx], kva)
+	}
+
+	for idx, intermediate := range intermediates {
+		fname := "intermediate" + strconv.Itoa(int(job.Id)) + "-" + strconv.Itoa(idx)
+		of, err := os.Create(fname)
+		if err != nil {
+			panic(err)
+		}
+		// json format...
+		encoder := json.NewEncoder(of)
+		for _, kva := range intermediate {
+			encoder.Encode(kva)
+		}
+		of.Close()
+	}
 }
 
 // example function to show how to make an RPC call to the master.
@@ -68,7 +120,6 @@ func CallExample() {
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := masterSock()
-	log.Println(sockname)
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
 		log.Fatal("dialing:", err)

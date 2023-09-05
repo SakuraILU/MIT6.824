@@ -70,7 +70,7 @@ func (m *Master) MakeReduceJobs() {
 	}
 
 	for _, intermediate := range intermediates {
-		job := NewJob(REDUCE, intermediate, m.nreduce)
+		job := NewJob(REDUCEREADY, intermediate, m.nreduce)
 		m.jm.Push(job)
 	}
 }
@@ -96,6 +96,7 @@ func (m *Master) JobDone(job *Job, reply *ExampleReply) (err error) {
 		case MAPPHASE:
 			m.phase = REDUCEPHASE
 			m.MakeReduceJobs()
+			log.Println("MAP OVER!")
 		case REDUCEPHASE:
 			m.phase = DONEPAHSE
 		}

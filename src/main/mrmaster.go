@@ -9,12 +9,17 @@ package main
 // Please do not change this file.
 //
 
-import "../mr"
-import "time"
-import "os"
-import "fmt"
+import (
+	"fmt"
+	"log"
+	"os"
+	"time"
+
+	"../mr"
+)
 
 func main() {
+	log.SetFlags(log.Lshortfile)
 	if len(os.Args) < 2 {
 		fmt.Fprintf(os.Stderr, "Usage: mrmaster inputfiles...\n")
 		os.Exit(1)
