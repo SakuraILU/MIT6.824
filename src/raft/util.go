@@ -15,3 +15,12 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	}
 	return
 }
+
+func (rf *Raft) lockState() {
+	rf.mu.Lock()
+}
+
+func (rf *Raft) unlockState() {
+	rf.persist()
+	rf.mu.Unlock()
+}

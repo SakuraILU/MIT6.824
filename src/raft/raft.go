@@ -18,12 +18,14 @@ package raft
 //
 
 import (
+	"bytes"
 	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"mit6.824/src/labgob"
 	"mit6.824/src/labrpc"
 )
 
@@ -103,7 +105,7 @@ type Raft struct {
 
 // 必须带锁rf.mu掉用该函数
 func (rf *Raft) resetElectionTimer() {
-	timeout := time.Duration(300+rand.Intn(300)) * time.Millisecond
+	timeout := time.Duration(400+rand.Intn(500)) * time.Millisecond
 	rf.electionTimer.Reset(timeout)
 	DPrintf("[Raft %d {%d}] resetElectionTimer: %v", rf.me, rf.currentTerm, timeout)
 }
@@ -122,8 +124,8 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.lockState()
+	defer rf.unlockState()
 	term = rf.currentTerm
 	isleader = (rf.state == LEADER)
 	return term, isleader
@@ -132,35 +134,41 @@ func (rf *Raft) GetState() (int, bool) {
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
+// 带锁rf.mu调用此函数
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	buffer := &bytes.Buffer{}
+	encoder := labgob.NewEncoder(buffer)
+
+	encoder.Encode(rf.currentTerm)
+	encoder.Encode(rf.voteFor)
+	encoder.Encode(rf.logs)
+
+	data := buffer.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
+// 带锁rf.mu调用此函数
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	buffer := bytes.NewBuffer(data)
+	decoder := labgob.NewDecoder(buffer)
+	var term int
+	var voteFor int
+	var logs []*LogEntry
+	if decoder.Decode(&term) != nil ||
+		decoder.Decode(&voteFor) != nil ||
+		decoder.Decode(&logs) != nil {
+		panic("Read Persist error")
+	} else {
+		rf.currentTerm = term
+		rf.voteFor = voteFor
+		rf.logs = logs
+	}
 }
 
 // example RequestVote RPC arguments structure.
@@ -190,8 +198,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.lockState()
+	defer rf.unlockState()
+
 	DPrintf("[Raft %d {%d}] RequestVote from %d", rf.me, rf.currentTerm, args.CandidateId)
 
 	// 竞选者的Term更小，拒绝
@@ -271,9 +280,9 @@ func (rf *Raft) election() {
 		return
 	}
 
-	rf.mu.Lock()
+	rf.lockState()
 	DPrintf("[Raft %d {%d}] startElection", rf.me, rf.currentTerm)
-	rf.mu.Unlock()
+	rf.unlockState()
 	resultChan := make(chan bool, len(rf.peers)) // 必须色缓冲通道，否则下一条语句会阻塞
 	resultChan <- true                           // 自己给自己投了一票
 	for i := range rf.peers {
@@ -282,9 +291,9 @@ func (rf *Raft) election() {
 		}
 
 		go func(i int) {
-			rf.mu.Lock()
+			rf.lockState()
 			if rf.state != CANDIDATE {
-				rf.mu.Unlock()
+				rf.unlockState()
 				return
 			}
 
@@ -294,23 +303,21 @@ func (rf *Raft) election() {
 				LastLogTerm:  rf.logs[len(rf.logs)-1].Term,
 				LastLogIndex: rf.logs[len(rf.logs)-1].Index,
 			}
-			rf.mu.Unlock()
+			rf.unlockState()
 
 			reply := &RequestVoteReply{}
 			ok := rf.sendRequestVote(i, args, reply)
 
-			rf.mu.Lock()
-			defer rf.mu.Unlock()
+			rf.lockState()
+			defer rf.unlockState()
+			if rf.state != CANDIDATE {
+				return
+			}
 
 			if !ok {
 				resultChan <- false
 				return
 			}
-
-			if rf.state != CANDIDATE {
-				return
-			}
-
 			if !reply.VoteGranted {
 				// 可能是对方dead或者比自己Term大，
 				// 如果是比自己Term大，当前节点不应该在低Term继续竞选领导人了
@@ -334,23 +341,23 @@ func (rf *Raft) election() {
 			votesGrantedNum++
 		}
 
-		rf.mu.Lock()
+		rf.lockState()
 		if rf.state != CANDIDATE {
-			rf.mu.Unlock()
+			rf.unlockState()
 			return
 		}
 
 		if votesGrantedNum > len(rf.peers)/2 {
 			rf.changeStateTo(LEADER)
-			rf.mu.Unlock()
+			rf.unlockState()
 			return
 		} else if votesCnt >= len(rf.peers) {
 			// 选举失败，重新开启新一轮选举
 			rf.changeStateTo(FOLLOWER)
-			rf.mu.Unlock()
+			rf.unlockState()
 			return
 		}
-		rf.mu.Unlock()
+		rf.unlockState()
 	}
 }
 
@@ -378,8 +385,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.lockState()
+	defer rf.unlockState()
+
 	DPrintf("[Raft %d {%d}] AppendEntries from %d", rf.me, rf.currentTerm, args.LeaderId)
 
 	// 竞选者的Term更小，拒绝
@@ -394,17 +402,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 		rf.voteFor = -1
 	}
-	rf.changeStateTo(FOLLOWER)
+	defer rf.changeStateTo(FOLLOWER)
 
 	// 该节点落后过多，Leader期望的PrevLogIndex 超过了当前节点的日志长度
-	if args.PrevLogIndex < 0 || args.PrevLogIndex >= len(rf.logs) {
+	if args.PrevLogIndex >= len(rf.logs) {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 
-		reply.XTerm = rf.logs[len(rf.logs)-1].Term
-		reply.XIndex = len(rf.logs) - 1
+		reply.XTerm = -1
+		reply.XIndex = len(rf.logs)
 		return
-
 	}
 	// 对比同一位置的Log是否与Leader的PrevLog相同
 	prevLog := rf.logs[args.PrevLogIndex]
@@ -415,7 +422,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// 让Leader发送其之后的所有元素
 		reply.XTerm = prevLog.Term
 		for i := prevLog.Index; i > 0; i-- {
-			if rf.logs[i].Term != rf.logs[i-1].Term {
+			if rf.logs[i-1].Term != prevLog.Term {
 				reply.XIndex = i
 				break
 			}
@@ -423,13 +430,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 	// 从PrevLogIndex+1同步Leader的日志
-	rf.logs = rf.logs[:args.PrevLogIndex+1]
-	rf.logs = append(rf.logs, args.Entries...)
-	rf.matchIndex[rf.me] = len(rf.logs) - 1
-	rf.nextIndex[rf.me] = len(rf.logs)
+	rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
 	DPrintf("[Raft %d {%d}] AppendEntries success, log length: %d", rf.me, rf.currentTerm, len(rf.logs))
 	// 同步Leader的commitIndex
-	rf.commitIndex = args.LeaderCommit
+	if args.LeaderCommit < len(rf.logs) {
+		rf.commitIndex = args.LeaderCommit
+	} else {
+		rf.commitIndex = len(rf.logs) - 1
+	}
 
 	reply.Term = rf.currentTerm
 	reply.Success = true
@@ -451,9 +459,9 @@ func (rf *Raft) heartBeat() {
 			}
 
 			go func(i int) {
-				rf.mu.Lock()
+				rf.lockState()
 				if rf.state != LEADER {
-					rf.mu.Unlock()
+					rf.unlockState()
 					return
 				}
 
@@ -470,7 +478,7 @@ func (rf *Raft) heartBeat() {
 					PrevLogTerm:  prevLog.Term,
 					PrevLogIndex: prevLog.Index,
 				}
-				rf.mu.Unlock()
+				rf.unlockState()
 
 				reply := &AppendEntriesReply{}
 
@@ -479,8 +487,8 @@ func (rf *Raft) heartBeat() {
 					return
 				}
 
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
+				rf.lockState()
+				defer rf.unlockState()
 
 				if rf.state != LEADER {
 					return
@@ -494,6 +502,9 @@ func (rf *Raft) heartBeat() {
 						return
 					} else {
 						rf.nextIndex[i] = reply.XIndex
+						if rf.nextIndex[i] <= 0 {
+							panic("shouldn't be zero!")
+						}
 					}
 				} else {
 					rf.matchIndex[i] = args.PrevLogIndex + len(args.Entries)
@@ -504,30 +515,30 @@ func (rf *Raft) heartBeat() {
 	}
 
 	for !rf.killed() {
-		rf.mu.Lock()
+		rf.lockState()
 		// DPrintf("[Raft %d {%d}] heartBeat", rf.me, rf.currentTerm)
 		if rf.state != LEADER {
-			rf.mu.Unlock()
+			rf.unlockState()
 			return
 		}
 		DPrintf("[Raft %d {%d}] heartBeat with log length: %d", rf.me, rf.currentTerm, len(rf.logs))
-		rf.mu.Unlock()
+		rf.unlockState()
 
 		<-rf.heartBeatTimer.C
 		broadcast()
 
-		rf.mu.Lock()
+		rf.lockState()
+		if rf.state != LEADER {
+			rf.unlockState()
+			return
+		}
 		rf.resetHeartBeatTimeout()
-		rf.mu.Unlock()
-
 		rf.updateCommitIndex()
+		rf.unlockState()
 	}
 }
 
 func (rf *Raft) updateCommitIndex() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	for ; rf.commitIndex < len(rf.logs); rf.commitIndex++ {
 		matchedNum := 0
 		for i := range rf.peers {
@@ -548,9 +559,9 @@ func (rf *Raft) applier() {
 	for !rf.killed() {
 		time.Sleep(10 * time.Millisecond)
 
-		rf.mu.Lock()
+		rf.lockState()
 		if rf.lastApplied >= rf.commitIndex || rf.lastApplied >= len(rf.logs)-1 {
-			rf.mu.Unlock()
+			rf.unlockState()
 			continue
 		}
 
@@ -561,23 +572,30 @@ func (rf *Raft) applier() {
 			Command:      log.Command,
 			CommandIndex: log.Index,
 		}
-		rf.mu.Unlock()
+		DPrintf("[Raft %d {%d}] apply log: %v", rf.me, rf.currentTerm, log)
+		rf.unlockState()
 
 		rf.applyCh <- applyMsg
-		DPrintf("[Raft %d {%d}] apply log: %v", rf.me, rf.currentTerm, log)
 	}
 }
 
 func (rf *Raft) follow() {
+	rf.lockState()
+	if rf.state != FOLLOWER {
+		rf.unlockState()
+		return
+	}
+	rf.unlockState()
+
 	<-rf.electionTimer.C
 
-	rf.mu.Lock()
+	rf.lockState()
 	if rf.state != FOLLOWER {
-		rf.mu.Unlock()
+		rf.unlockState()
 		return
 	}
 	rf.changeStateTo(CANDIDATE)
-	rf.mu.Unlock()
+	rf.unlockState()
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -593,8 +611,8 @@ func (rf *Raft) follow() {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.lockState()
+	defer rf.unlockState()
 	if rf.killed() || rf.state != LEADER {
 		return -1, -1, false
 	}
@@ -615,9 +633,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 func (rf *Raft) StateMachine() {
 	for !rf.killed() {
-		rf.mu.Lock()
+		rf.lockState()
 		state := rf.state
-		rf.mu.Unlock()
+		rf.unlockState()
 		DPrintf("[Raft %d] StateMachine: %v", rf.me, state)
 
 		switch state {
@@ -651,10 +669,10 @@ func (rf *Raft) changeStateTo(state State) {
 // 不带锁rf.mu调用该函数
 // 该函数会阻塞，直到有其他goroutine调用changeStateTo
 func (rf *Raft) waitStateChange() {
-	state := <-rf.stateChan
+	rf.lockState()
+	defer rf.unlockState()
 
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	state := <-rf.stateChan
 
 	switch rf.state {
 	case FOLLOWER:
@@ -685,7 +703,6 @@ func (rf *Raft) waitStateChange() {
 			} else {
 				panic(fmt.Sprintf("Invalid state change from %v to %v", rf.state, state))
 			}
-
 			break
 		}
 	case LEADER:
@@ -695,7 +712,6 @@ func (rf *Raft) waitStateChange() {
 			} else {
 				panic(fmt.Sprintf("Invalid state change from %v to %v", rf.state, state))
 			}
-
 			break
 		}
 	}
@@ -740,7 +756,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.state = FOLLOWER
-	rf.stateChan = make(chan State, 1)
+	rf.stateChan = make(chan State, 1000)
 	rf.currentTerm = 0
 	rf.voteFor = -1
 	rf.electionTimer = time.NewTimer(0)
@@ -748,19 +764,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.heartBeatTimer = time.NewTimer(0)
 	rf.resetHeartBeatTimeout()
 
-	rf.logs = append(rf.logs, &LogEntry{Term: -1, Index: 0, Command: nil})
+	rf.logs = append(rf.logs, &LogEntry{Term: 0, Index: 0})
 	rf.commitIndex = 0
 	rf.lastApplied = 0
+	rf.applyCh = applyCh
+
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 	for i := range rf.peers {
 		rf.nextIndex[i] = len(rf.logs)
 		rf.matchIndex[i] = 0
 	}
-	rf.applyCh = applyCh
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
 
 	DPrintf("Initiate raft server %d as %v", rf.me, rf.state)
 
