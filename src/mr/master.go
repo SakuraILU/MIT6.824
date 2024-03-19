@@ -52,6 +52,7 @@ func (m *Master) MakeMapJobs(files []string) {
 }
 
 func (m *Master) MakeReduceJobs() {
+	log.Println("MakeReduceJobs")
 	intermediates := make([][]string, m.nreduce)
 	entries, err := ioutil.ReadDir(".")
 	if err != nil {
@@ -60,6 +61,7 @@ func (m *Master) MakeReduceJobs() {
 
 	for _, entry := range entries {
 		fname := entry.Name()
+		log.Printf("fname: %s", fname)
 		if strings.HasPrefix(fname, "intermediate") {
 			idx, err := strconv.Atoi(fname[len(fname)-1:])
 			if err != nil {
@@ -75,11 +77,15 @@ func (m *Master) MakeReduceJobs() {
 	}
 }
 
-func (m *Master) GetJob(args *ExampleArgs, job *Job) error {
+func (m *Master) GetJob(args *ExampleArgs, job *Job) (err error) {
 	j := m.jm.Pop()
-	// log.Printf("%v", job)
 	if j == nil {
-		return fmt.Errorf("no job is to be disturbed")
+		if m.phase == DONEPAHSE {
+			j = NewJob(DONE, nil, 0)
+		} else {
+			err = fmt.Errorf("no job is to be disturbed")
+			return
+		}
 	}
 
 	*job = *j
@@ -87,6 +93,10 @@ func (m *Master) GetJob(args *ExampleArgs, job *Job) error {
 }
 
 func (m *Master) JobDone(job *Job, reply *ExampleReply) (err error) {
+	if m.phase == DONEPAHSE {
+		return
+	}
+
 	if err = m.jm.JobDone(job); err != nil {
 		return
 	}
@@ -94,15 +104,14 @@ func (m *Master) JobDone(job *Job, reply *ExampleReply) (err error) {
 	if m.jm.CheckAllDone() {
 		switch m.phase {
 		case MAPPHASE:
-			m.phase = REDUCEPHASE
 			m.MakeReduceJobs()
-			log.Println("MAP OVER!")
+			m.phase = REDUCEPHASE
 		case REDUCEPHASE:
 			m.phase = DONEPAHSE
 		}
 	}
 
-	return nil
+	return
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -132,11 +141,9 @@ func (m *Master) server() {
 // main/mrmaster.go calls Done() periodically to find out
 // if the entire job has finished.
 func (m *Master) Done() bool {
-	ret := false
-
 	// Your code here.
 
-	return ret
+	return m.phase == DONEPAHSE
 }
 
 // create a Master.

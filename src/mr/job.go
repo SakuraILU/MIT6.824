@@ -9,7 +9,7 @@ import (
 type JobType int
 
 const (
-	MAPREADY JobType = iota
+	MAPREADY JobType = iota + 1
 	MAP
 	REDUCEREADY
 	REDUCE
@@ -42,7 +42,7 @@ type Job struct {
 }
 
 func NewJob(typ JobType, filename []string, nreduce int) (j *Job) {
-	if typ != MAPREADY && typ != REDUCEREADY {
+	if typ == MAP || typ == REDUCE {
 		log.Printf("Job created should be in ready state, but in %v instead", typ)
 		return nil
 	}
@@ -54,5 +54,6 @@ func NewJob(typ JobType, filename []string, nreduce int) (j *Job) {
 		NReduce:   nreduce,
 		StartTime: time.Now(),
 	}
+	// log.Printf("New job (%d, %s, %d)", typ, filename, j.Id)
 	return
 }

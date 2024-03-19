@@ -35,8 +35,6 @@ func (jm *JobManager) Push(j *Job) {
 
 	jm.jobchan <- j
 	jm.jobs[j.Id] = j
-
-	log.Printf("Put job (%s, %d)", j.Filename, j.Id)
 }
 
 func (jm *JobManager) Pop() (j *Job) {
