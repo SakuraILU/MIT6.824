@@ -29,11 +29,11 @@ func (rf *Raft) changeStateTo(state State) {
 	case FOLLOWER:
 		{
 			if state == FOLLOWER {
-				rf.resetElectionTimer()
+				// rf.resetElectionTimer()
 			} else if state == CANDIDATE {
 				rf.currentTerm++
 				rf.voteFor = rf.me
-				rf.resetElectionTimer()
+				// rf.resetElectionTimer()
 			} else {
 				panic(fmt.Sprintf("Invalid state change from %v to %v", rf.state, state))
 			}
@@ -42,11 +42,11 @@ func (rf *Raft) changeStateTo(state State) {
 	case CANDIDATE:
 		{
 			if state == FOLLOWER {
-				rf.resetElectionTimer()
+				// rf.resetElectionTimer()
 			} else if state == CANDIDATE {
 				rf.currentTerm++
 				rf.voteFor = rf.me
-				rf.resetElectionTimer()
+				// rf.resetElectionTimer()
 			} else if state == LEADER {
 				// 注意Leader才需要维护nextIndex和matchIndex，用与更新commitIndex
 				// 而follower的commitIndex是Leader同步过去的
@@ -63,7 +63,7 @@ func (rf *Raft) changeStateTo(state State) {
 	case LEADER:
 		{
 			if state == FOLLOWER {
-				rf.resetElectionTimer()
+				// rf.resetElectionTimer()
 			} else {
 				panic(fmt.Sprintf("Invalid state change from %v to %v", rf.state, state))
 			}

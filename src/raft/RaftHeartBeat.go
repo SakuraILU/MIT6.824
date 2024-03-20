@@ -19,6 +19,8 @@ type AppendEntriesReply struct {
 	XIndex int // 快速回退时用，term是Xterm的最早的index
 }
 
+var heartBeatDuration = 50
+
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.lockState()
 	defer rf.unlockState()
@@ -120,7 +122,7 @@ func (rf *Raft) heartBeat() {
 			rf.lockState()
 			defer rf.unlockState()
 			// important bug
-			if rf.state != LEADER || rf.currentTerm != args.Term {
+			if !rf.stateUnchanged(LEADER, args.Term) {
 				return
 			}
 
@@ -133,7 +135,20 @@ func (rf *Raft) heartBeat() {
 				rf.voteFor = -1
 				rf.changeStateTo(FOLLOWER)
 			} else {
-				rf.nextIndex[i] = reply.XIndex
+				// 快速回退
+				// 根据reply.XTerm和reply.XIndex，找到下一个需要同步的位置
+				if reply.XTerm == -1 {
+					rf.nextIndex[i] = reply.XIndex
+				} else {
+					nextIndex := 0
+					for index := len(rf.logs) - 1; index >= 1; index-- {
+						if rf.logs[index].Term == reply.XTerm {
+							nextIndex = index
+							break
+						}
+					}
+					rf.nextIndex[i] = max(1, min(rf.nextIndex[i]-1, nextIndex))
+				}
 			}
 
 		}(i)
@@ -180,7 +195,7 @@ func (rf *Raft) heartBeatHandler() {
 		}
 		rf.unlockState()
 
-		go rf.heartBeat()
+		rf.heartBeat()
 
 		time.Sleep(rf.heartBeatDuration)
 	}

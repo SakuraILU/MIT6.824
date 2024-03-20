@@ -15,6 +15,8 @@ type RequestVoteArgs struct {
 	LastLogIndex int // 竞选者的最后一个Log的Index
 }
 
+var electionTimeout = 400
+
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
@@ -64,7 +66,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	// 竞选者有更大或至少相同的log，同意投票
-	rf.changeStateTo(FOLLOWER)
+	rf.resetElectionTimer()
 
 	rf.voteFor = args.CandidateId
 
@@ -120,6 +122,7 @@ func (rf *Raft) electionHandler() {
 
 		if time.Now().After(rf.electionTime) {
 			rf.changeStateTo(CANDIDATE)
+			rf.resetElectionTimer()
 			rf.unlockState()
 
 			go rf.election()
@@ -161,7 +164,7 @@ func (rf *Raft) election() {
 			rf.lockState()
 			defer rf.unlockState()
 			// important bug
-			if rf.state != CANDIDATE || rf.currentTerm != args.Term {
+			if !rf.stateUnchanged(CANDIDATE, args.Term) {
 				return
 			}
 
@@ -174,6 +177,7 @@ func (rf *Raft) election() {
 				// 如果是比自己Term大，当前节点不应该在低Term继续竞选领导人了
 				if rf.currentTerm < reply.Term {
 					rf.currentTerm = reply.Term
+					rf.voteFor = -1
 					rf.changeStateTo(FOLLOWER)
 				}
 				resultChan <- false
@@ -198,7 +202,7 @@ func (rf *Raft) election() {
 		// 但恰好该节点又变成了CANDIDATE... 前后两轮的election同时进行，这肯定不行啊，
 		// 老的轮次需要被结束，所以需要同时检查[state + term]是否和进入时一致。
 		// 几个RPC Call里的其他几处类似的地方同理
-		if rf.state != CANDIDATE || rf.currentTerm != args.Term {
+		if !rf.stateUnchanged(CANDIDATE, args.Term) {
 			rf.unlockState()
 			return
 		}
@@ -219,7 +223,7 @@ func (rf *Raft) election() {
 
 // 必须带锁rf.mu掉用该函数
 func (rf *Raft) resetElectionTimer() {
-	timeout := time.Duration(500+rand.Intn(500)) * time.Millisecond
+	timeout := time.Duration(electionTimeout+rand.Intn(int(electionTimeout))) * time.Millisecond
 	rf.electionTime = time.Now().Add(timeout)
 	DPrintf("[Raft %d {%d}] resetElectionTimer: %v", rf.me, rf.currentTerm, timeout)
 }

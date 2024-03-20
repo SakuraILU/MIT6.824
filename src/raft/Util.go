@@ -25,6 +25,11 @@ func (rf *Raft) unlockState() {
 	rf.mu.Unlock()
 }
 
+// 必须带锁rf.mu调用该函数
+func (rf *Raft) stateUnchanged(state State, term int) bool {
+	return rf.state == state && rf.currentTerm == term
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a

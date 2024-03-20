@@ -205,8 +205,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = FOLLOWER
 	rf.currentTerm = 0
 	rf.voteFor = -1
-	rf.resetElectionTimer()
-	rf.heartBeatDuration = 100 * time.Millisecond
+	rf.heartBeatDuration = time.Duration(heartBeatDuration) * time.Millisecond
 
 	rf.logs = append(rf.logs, &LogEntry{Term: 0, Index: 0})
 	rf.commitIndex = 0
@@ -221,6 +220,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	DPrintf("Initiate raft server %d as %v", rf.me, rf.state)
 
+	rf.resetElectionTimer()
 	// Your code here (2B).
 	go rf.electionHandler()
 	go rf.heartBeatHandler()
