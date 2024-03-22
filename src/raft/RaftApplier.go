@@ -19,7 +19,7 @@ func (rf *Raft) applier() {
 		}
 
 		rf.lastApplied++
-		log := rf.logs[rf.lastApplied]
+		log := rf.logs.getLog(rf.lastApplied)
 		applyMsg := ApplyMsg{
 			CommandValid: true,
 			Command:      log.Command,

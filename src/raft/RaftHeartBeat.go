@@ -45,24 +45,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 具体投票与否还是得看Logs
 	// 该节点落后过多，Leader期望的PrevLogIndex 超过了当前节点的日志长度
-	if args.PrevLogIndex >= len(rf.logs) {
+	if args.PrevLogIndex >= rf.logs.getLogLength() {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 
 		reply.XTerm = -1
-		reply.XIndex = len(rf.logs)
+		reply.XIndex = rf.logs.getLogLength()
 		return
 	}
 	// 对比同一位置的Log是否与Leader的PrevLog相同
-	prevLog := rf.logs[args.PrevLogIndex]
+	prevLog := rf.logs.getLog(args.PrevLogIndex)
 	if prevLog.Term != args.PrevLogTerm || prevLog.Index != args.PrevLogIndex {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		// 寻找与冲突的PrevLogTerm相同Term的第一个Index，
 		// 让Leader发送其之后的所有元素
 		reply.XTerm = prevLog.Term
-		for i := prevLog.Index; i > 0; i-- {
-			if rf.logs[i-1].Term != prevLog.Term {
+		reply.XIndex = rf.logs.getLastIncludedIndex() + 1
+		for i := prevLog.Index; i > rf.logs.getLastIncludedIndex(); i-- {
+			if rf.logs.getLog(i-1).Term != prevLog.Term {
 				reply.XIndex = i
 				break
 			}
@@ -70,10 +71,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 	// 从PrevLogIndex+1同步Leader的日志
-	rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
-	DPrintf("[Raft %d {%d}] AppendEntries success, log length: %d", rf.me, rf.currentTerm, len(rf.logs))
+	rf.logs.appendLogs(args.PrevLogIndex+1, args.Entries)
+	DPrintf("[Raft %d {%d}] AppendEntries success, log length: %d", rf.me, rf.currentTerm, rf.logs.getLogLength())
 	// 同步Leader的commitIndex
-	rf.commitIndex = min(args.LeaderCommit, len(rf.logs)-1)
+	rf.commitIndex = min(args.LeaderCommit, rf.logs.getLastIndex())
 
 	reply.Term = rf.currentTerm
 	reply.Success = true
@@ -97,60 +98,110 @@ func (rf *Raft) heartBeat() {
 				return
 			}
 
-			entries := make([]*LogEntry, 0)
-			if rf.nextIndex[i] < len(rf.logs) {
-				entries = append(entries, rf.logs[rf.nextIndex[i]:]...)
-			}
-			prevLog := rf.logs[rf.nextIndex[i]-1]
-			args := &AppendEntriesArgs{
-				LeaderId:     rf.me,
-				Term:         rf.currentTerm,
-				LeaderCommit: rf.commitIndex,
-				Entries:      entries,
-				PrevLogTerm:  prevLog.Term,
-				PrevLogIndex: prevLog.Index,
-			}
-			rf.unlockState()
+			if rf.nextIndex[i] <= rf.logs.getLastIncludedIndex() {
+				// 如果nextIndex[i] 在snapshot里面，发送InstallSnapshot给follower，
+				// 先把snapshot同步过去
+				args := &InstallSnapshotArgs{
+					LeaderId:          rf.me,
+					Term:              rf.currentTerm,
+					LastIncludedIndex: rf.logs.getLastIncludedIndex(),
+					LastIncludedTerm:  rf.logs.getLastIncludedTerm(),
+					Data:              rf.snapshot,
+				}
+				rf.unlockState()
 
-			reply := &AppendEntriesReply{}
+				reply := &InstallSnapshotReply{}
+				DPrintf("[Raft %d {%d}] sendInstallSnapshot to %d", rf.me, rf.currentTerm, i)
+				ok := rf.sendInstallSnapshot(i, args, reply)
+				if !ok {
+					return
+				}
 
-			ok := rf.sendAppendEntries(i, args, reply)
-			if !ok {
-				return
-			}
+				rf.lockState()
+				defer rf.unlockState()
+				// important bug
+				// 过时的InstallSnapshot RPC，不用理会
+				if !rf.stateUnchanged(LEADER, args.Term) {
+					return
+				}
 
-			rf.lockState()
-			defer rf.unlockState()
-			// important bug
-			if !rf.stateUnchanged(LEADER, args.Term) {
-				return
-			}
-
-			if reply.Success {
-				rf.matchIndex[i] = prevLog.Index + len(args.Entries)
-				rf.nextIndex[i] = rf.matchIndex[i] + 1
-				rf.updateCommitIndex()
-			} else if reply.Term > args.Term {
-				rf.currentTerm = reply.Term
-				rf.voteFor = -1
-				rf.changeStateTo(FOLLOWER)
-			} else {
-				// 快速回退
-				// 根据reply.XTerm和reply.XIndex，找到下一个需要同步的位置
-				if reply.XTerm == -1 {
-					rf.nextIndex[i] = reply.XIndex
+				if reply.Term > args.Term {
+					// 如果Term更大，变成FOLLOWER
+					rf.currentTerm = reply.Term
+					rf.voteFor = -1
+					rf.changeStateTo(FOLLOWER)
 				} else {
-					nextIndex := 0
-					for index := len(rf.logs) - 1; index >= 1; index-- {
-						if rf.logs[index].Term == reply.XTerm {
-							nextIndex = index
-							break
+					// 如果snapshot同步成功，更新nextIndex和matchIndex
+					rf.nextIndex[i] = rf.logs.getLastIncludedIndex() + 1
+					rf.matchIndex[i] = rf.logs.getLastIncludedIndex()
+				}
+			} else {
+				// 如果nextIndex[i] 在logs里面，发送AppendEntries给follower，
+				// 同步后续的log
+				entries := make([]*LogEntry, 0)
+				if rf.nextIndex[i] < rf.logs.getLogLength() {
+					entries = append(entries, rf.logs.getLogsFrom(rf.nextIndex[i])...)
+				}
+				prevLog := rf.logs.getLog(rf.nextIndex[i] - 1)
+				args := &AppendEntriesArgs{
+					LeaderId:     rf.me,
+					Term:         rf.currentTerm,
+					LeaderCommit: rf.commitIndex,
+					Entries:      entries,
+					PrevLogTerm:  prevLog.Term,
+					PrevLogIndex: prevLog.Index,
+				}
+				rf.unlockState()
+
+				reply := &AppendEntriesReply{}
+				DPrintf("[Raft %d {%d}] sendAppendEntries to %d", rf.me, rf.currentTerm, i)
+				ok := rf.sendAppendEntries(i, args, reply)
+				if !ok {
+					return
+				}
+
+				rf.lockState()
+				defer rf.unlockState()
+				// important bug
+				// 过时的AppendEntries RPC，不用理会
+				if !rf.stateUnchanged(LEADER, args.Term) {
+					return
+				}
+
+				if reply.Success {
+					// 如果同步成功，更新nextIndex和matchIndex
+					rf.matchIndex[i] = prevLog.Index + len(args.Entries)
+					rf.nextIndex[i] = rf.matchIndex[i] + 1
+					// matchIndex[i]更新，可能导致commitIndex更新
+					rf.updateCommitIndex()
+				} else if reply.Term > args.Term {
+					// 如果Term更大，变成FOLLOWER
+					rf.currentTerm = reply.Term
+					rf.voteFor = -1
+					rf.changeStateTo(FOLLOWER)
+				} else {
+					// 失败时，根据reply的信息做快速回退
+					if reply.XTerm == -1 {
+						// 如果没有冲突的Term，follower的logs太短了，
+						// reply.XIndex指明了follower logs的末尾，同步后面的logs
+						rf.nextIndex[i] = reply.XIndex
+					} else {
+						// 如果有冲突的Term，冲突的位置应该在这个XTerm的某个记录上，
+						// reply.XIndex是冲突Term的第一个Index，这是悲观估计，需要同步进可能多。
+						// 悲观估计有时会导致很多多余的logs同步，尤其是在同一个Term中运行了很久的Leader的记录中发生了冲突时。
+						// 因此这里需要找到XTerm的最后一个Index，乐观估计。如果冲突位置在乐观估计之前，就保守地一格一格往前走。
+						nextIndex := rf.logs.getLastIncludedIndex()
+						for index := rf.logs.getLogLength() - 1; index > rf.logs.getLastIncludedIndex(); index-- {
+							if rf.logs.getLog(index).Term == reply.XTerm {
+								nextIndex = index
+								break
+							}
 						}
+						// a little trick，乐观估计快速回退和保守回退法取最小，其实就是上述效果：先乐观快回再保守回退
+						rf.nextIndex[i] = min(rf.nextIndex[i]-1, nextIndex)
 					}
-					rf.nextIndex[i] = max(1, min(rf.nextIndex[i]-1, nextIndex))
 				}
 			}
-
 		}(i)
 	}
 }
@@ -158,7 +209,7 @@ func (rf *Raft) heartBeat() {
 // 更新commitIndex
 // 注意必须带锁rf.mu掉用该函数
 func (rf *Raft) updateCommitIndex() {
-	for i := len(rf.logs) - 1; i > rf.commitIndex; i-- {
+	for i := rf.logs.getLogLength() - 1; i > rf.commitIndex; i-- {
 		// important bug
 		// commitIndex 只能移动到当前Term的地方，如果本轮没有新log，
 		// 无法commit任何东西
@@ -170,7 +221,7 @@ func (rf *Raft) updateCommitIndex() {
 		// 总之，老Leader的term多种多样，活着的比较旧，然后死了，新一些地接替他，会把原来提交地覆盖掉。
 		// 因此，我们必须要把最新得term一起log下去才行，这样再新的老Leader也比最新的旧，
 		// 复活后不可能成为新Leader了， solve the problem。
-		if rf.logs[i].Term == rf.currentTerm {
+		if rf.logs.getLog(i).Term == rf.currentTerm {
 			matchedNum := 0
 			for peerIdx := range rf.peers {
 				if rf.matchIndex[peerIdx] >= i {

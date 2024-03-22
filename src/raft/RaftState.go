@@ -51,10 +51,10 @@ func (rf *Raft) changeStateTo(state State) {
 				// 注意Leader才需要维护nextIndex和matchIndex，用与更新commitIndex
 				// 而follower的commitIndex是Leader同步过去的
 				for peerIdx := range rf.peers {
-					rf.nextIndex[peerIdx] = len(rf.logs)
+					rf.nextIndex[peerIdx] = rf.logs.getLogLength()
 					rf.matchIndex[peerIdx] = -1
 				}
-				rf.matchIndex[rf.me] = len(rf.logs) - 1
+				rf.matchIndex[rf.me] = rf.logs.getLogLength() - 1
 			} else {
 				panic(fmt.Sprintf("Invalid state change from %v to %v", rf.state, state))
 			}

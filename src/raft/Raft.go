@@ -19,6 +19,7 @@ package raft
 
 import (
 	"bytes"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,15 +41,15 @@ import (
 // snapshots) on the applyCh; at that point you can add fields to
 // ApplyMsg, but set CommandValid to false for these other uses.
 type ApplyMsg struct {
+	// Log Command 2B
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
-}
-
-type LogEntry struct {
-	Term    int         // 该条日志的Term
-	Index   int         // 该条日志的Index
-	Command interface{} // 该条日志的命令
+	// Snapshot 2D
+	SnapshotValid bool
+	Snapshot      []byte
+	SnapshotTerm  int
+	SnapshotIndex int
 }
 
 // A Go object implementing a single Raft peer.
@@ -67,7 +68,8 @@ type Raft struct {
 	currentTerm int   // 此节点的任期
 	voteFor     int   // 在当前任期内，此节点将选票投给了谁。
 	// 2B
-	logs        []*LogEntry   // 日志
+	logs        *Logs         // 日志
+	snapshot    []byte        // 快照
 	commitIndex int           // 已经提交的日志的Index
 	lastApplied int           // 已经应用的日志的Index
 	nextIndex   []int         // 每个节点下一条要发送的日志的Index
@@ -106,11 +108,11 @@ func (rf *Raft) persist() {
 	encoder.Encode(rf.logs)
 
 	data := buffer.Bytes()
-	rf.persister.SaveRaftState(data)
+	rf.persister.SaveStateAndSnapshot(data, rf.snapshot)
 }
 
 // restore previously persisted state.
-// 带锁rf.mu调用此函数
+// 带锁rf.mu调用此函数,除了单线程启动时
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
@@ -120,10 +122,10 @@ func (rf *Raft) readPersist(data []byte) {
 	decoder := labgob.NewDecoder(buffer)
 	var term int
 	var voteFor int
-	var logs []*LogEntry
+	logs := &Logs{}
 	if decoder.Decode(&term) != nil ||
 		decoder.Decode(&voteFor) != nil ||
-		decoder.Decode(&logs) != nil {
+		decoder.Decode(logs) != nil {
 		panic("Read Persist error")
 	} else {
 		rf.currentTerm = term
@@ -153,17 +155,46 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	term := rf.currentTerm
-	index := len(rf.logs)
+	index := rf.logs.getLogLength()
 	DPrintf("[Raft %d {%d}] Add log: %v in %d", rf.me, rf.currentTerm, command, index)
-	rf.logs = append(rf.logs, &LogEntry{
+	rf.logs.appendLog(&LogEntry{
 		Term:    term,
 		Index:   index,
 		Command: command,
 	})
-	rf.matchIndex[rf.me] = len(rf.logs) - 1
-	rf.nextIndex[rf.me] = len(rf.logs)
+
+	rf.matchIndex[rf.me] = rf.logs.getLogLength() - 1
+	rf.nextIndex[rf.me] = rf.logs.getLogLength()
 
 	return index, term, true
+}
+
+// A service wants to switch to snapshot.  Only do so if Raft hasn't
+// have more recent info since it communicate the snapshot on applyCh.
+func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
+	// Your code here (2D).
+	rf.lockState()
+	defer rf.unlockState()
+	DPrintf("[Raft %d {%d}] CondInstallSnapshot from %d", rf.me, rf.currentTerm, lastIncludedIndex)
+	return true
+}
+
+// the service says it has created a snapshot that has
+// all info up to and including index. this means the
+// service no longer needs the log through (and including)
+// that index. Raft should now trim its log as much as possible.
+func (rf *Raft) Snapshot(index int, snapshot []byte) {
+	rf.lockState()
+	defer rf.unlockState()
+	DPrintf("[Raft %d {%d}] Snapshot from %d", rf.me, rf.currentTerm, index)
+	if index <= rf.logs.getLastIncludedIndex() {
+		return
+	} else if index >= rf.logs.getLogLength() {
+		panic(fmt.Sprintf("[Raft %d] snapshot too much at %d, total length is %d", rf.me, index, rf.logs.getLogLength()))
+	}
+
+	rf.logs.truncLogBefore(index)
+	rf.snapshot = snapshot
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -206,17 +237,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.voteFor = -1
 	rf.heartBeatDuration = time.Duration(heartBeatDuration) * time.Millisecond
-
-	rf.logs = append(rf.logs, &LogEntry{Term: 0, Index: 0})
-	rf.commitIndex = 0
-	rf.lastApplied = 0
+	rf.logs = MakeLogs(0, 0)
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
-
 	rf.applyCh = applyCh
-
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.snapshot = persister.ReadSnapshot()
+	rf.commitIndex = rf.logs.getLastIncludedIndex()
+	rf.lastApplied = rf.logs.getLastIncludedIndex()
 
 	DPrintf("Initiate raft server %d as %v", rf.me, rf.state)
 

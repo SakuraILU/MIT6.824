@@ -56,8 +56,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 竞选者的Term更大，继续检查Log，节点只会投给Log更大的Candidate！
 	// 例如可能有小分区的节点加入进来，那个分区一直在不断的选举，但是没有人能够获得大多数选票，
 	// 导致节点的Term很大，但是Log却很小，与当前分区的节点的Log冲突
-	lastLogTerm := rf.logs[len(rf.logs)-1].Term
-	lastLogIndex := rf.logs[len(rf.logs)-1].Index
+	lastLogTerm := rf.logs.getLastTerm()
+	lastLogIndex := rf.logs.getLastIndex()
 	// log长度更小，拒绝
 	if args.LastLogTerm < lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex < lastLogIndex) {
 		reply.Term = rf.currentTerm
@@ -138,8 +138,8 @@ func (rf *Raft) election() {
 	args := &RequestVoteArgs{
 		CandidateId:  rf.me,
 		Term:         rf.currentTerm,
-		LastLogTerm:  rf.logs[len(rf.logs)-1].Term,
-		LastLogIndex: rf.logs[len(rf.logs)-1].Index,
+		LastLogTerm:  rf.logs.getLastTerm(),
+		LastLogIndex: rf.logs.getLastIndex(),
 	}
 	DPrintf("[Raft %d {%d}] startElection", rf.me, rf.currentTerm)
 	rf.unlockState()
@@ -164,6 +164,7 @@ func (rf *Raft) election() {
 			rf.lockState()
 			defer rf.unlockState()
 			// important bug
+			// 过时的RequestVote RPC，不用理会
 			if !rf.stateUnchanged(CANDIDATE, args.Term) {
 				return
 			}
