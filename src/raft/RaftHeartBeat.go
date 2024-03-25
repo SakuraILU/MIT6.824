@@ -1,6 +1,9 @@
 package raft
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 type AppendEntriesArgs struct {
 	LeaderId     int         // 领导者的ID
@@ -19,7 +22,7 @@ type AppendEntriesReply struct {
 	XIndex int // 快速回退时用，term是Xterm的最早的index
 }
 
-var heartBeatDuration = 50
+var heartBeatDuration = 40 * time.Millisecond
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.lockState()
@@ -53,156 +56,223 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.XIndex = rf.logs.getLogLength()
 		return
 	}
-	// 对比同一位置的Log是否与Leader的PrevLog相同
-	prevLog := rf.logs.getLog(args.PrevLogIndex)
-	if prevLog.Term != args.PrevLogTerm || prevLog.Index != args.PrevLogIndex {
+
+	// 如果PrevLogIndex在snapshot里面，snapshot部分已经提交，不需要再同步
+	// 直接同步后续全量日志，用XTerm = -1作为精准回退的标志
+	if args.PrevLogIndex < rf.logs.getLastIncludedIndex() {
 		reply.Term = rf.currentTerm
 		reply.Success = false
-		// 寻找与冲突的PrevLogTerm相同Term的第一个Index，
-		// 让Leader发送其之后的所有元素
-		reply.XTerm = prevLog.Term
+
+		reply.XTerm = -1
 		reply.XIndex = rf.logs.getLastIncludedIndex() + 1
-		for i := prevLog.Index; i > rf.logs.getLastIncludedIndex(); i-- {
-			if rf.logs.getLog(i-1).Term != prevLog.Term {
-				reply.XIndex = i
+		return
+	}
+
+	// 如果PrevLogIndex在logs里面，检查PrevLogTerm是否匹配
+	prevLog := rf.logs.getLog(args.PrevLogIndex)
+	if prevLog.Term != args.PrevLogTerm {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+
+		reply.XTerm = prevLog.Term
+		// 找到一个悲观估计的冲突位置
+		// 从PrevLogIndex-1开始往前找，找到冲突Term（prevLogTerm）的第一个位置
+		// 虽然这个位置不一定是真正的冲突位置，但是可以保证这个位置之后的log都是冲突的
+		// 然而。。。Leader其实没有用上，Leader用的是同Term的悲观估计，悲观估计失败后
+		// 继续往前保守回退，所以这个悲观估计的冲突位置是没用的，只是为了和Paper一致
+		reply.XIndex = rf.logs.getLastIncludedIndex() + 1
+		for i := args.PrevLogIndex - 1; i >= rf.logs.getLastIncludedIndex(); i-- {
+			if rf.logs.getLog(i).Term != prevLog.Term {
+				reply.XIndex = i + 1
 				break
 			}
 		}
 		return
 	}
+
 	// 从PrevLogIndex+1同步Leader的日志
 	rf.logs.appendLogs(args.PrevLogIndex+1, args.Entries)
 	DPrintf("[Raft %d {%d}] AppendEntries success, log length: %d", rf.me, rf.currentTerm, rf.logs.getLogLength())
 	// 同步Leader的commitIndex
-	rf.commitIndex = min(args.LeaderCommit, rf.logs.getLastIndex())
+	// important bug
+	// 切换Leader后，新Leader的commitIndex可能比老Leader的commitIndex小
+	// 而follower本身也是比老Leader小的，不太好论证新Leader的commitIndex在切换后一定比follower大
+	// 为了使得commitIndex不会回退，这里需要取Leader和follower的commitIndex的最大值
+	// where to locate this bug：updateCommitIndex(): invalid getLog(i)
+	// rf.commitIndex = max(args.LeaderCommit, rf.commitIndex)
+	rf.setCommitIndexSafe(args.LeaderCommit)
+	if rf.commitIndex >= rf.logs.getLogLength() {
+		panic(fmt.Sprintf("commitIndex: %d, log length: %d", rf.commitIndex, rf.logs.getLogLength()))
+	}
 
 	reply.Term = rf.currentTerm
 	reply.Success = true
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	return ok
+	ch := make(chan bool, 1) // 创建一个缓冲为1的channel
+
+	// 启动一个goroutine来执行RPC调用
+	go func() {
+		ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+		ch <- ok // 将RPC调用的结果发送到channel中
+	}()
+
+	select {
+	case ok := <-ch:
+		// 成功接收到RPC调用的结果
+		return ok
+	case <-time.After(rf.sendRPCTimeout):
+		// 超时
+		return false
+	}
 }
 
+// 向某一个peer发送心跳的线程
+func (rf *Raft) heartBeatForPeer(i int) {
+	for !rf.killed() {
+		rf.lockState()
+
+		rf.heartBeatConds[i].Wait()
+		for rf.state != LEADER {
+			rf.heartBeatConds[i].Wait()
+		}
+
+		if rf.nextIndex[i] <= rf.logs.getLastIncludedIndex() {
+			// 如果nextIndex[i] 在snapshot说面，之前的log已经被snapshot了，
+			// 所以直接发送InstallSnapshot给follower，先把snapshot同步过去
+			// 之后再继续同步后续logs
+			args := &InstallSnapshotArgs{
+				LeaderId:          rf.me,
+				Term:              rf.currentTerm,
+				LastIncludedIndex: rf.logs.getLastIncludedIndex(),
+				LastIncludedTerm:  rf.logs.getLastIncludedTerm(),
+				Data:              rf.persister.ReadSnapshot(),
+			}
+			rf.unlockState()
+
+			reply := &InstallSnapshotReply{}
+			DPrintf("[Raft %d {%d}] sendInstallSnapshot to %d", rf.me, rf.currentTerm, i)
+			ok := rf.sendInstallSnapshot(i, args, reply)
+			if !ok {
+				continue
+			}
+
+			rf.lockState()
+			// important bug
+			// 过时的InstallSnapshot RPC，不用理会
+			if !rf.stateUnchanged(LEADER, args.Term) {
+				rf.unlockState()
+				continue
+			}
+
+			if reply.Term > args.Term {
+				// 如果Term更大，变成FOLLOWER
+				rf.currentTerm = reply.Term
+				rf.voteFor = -1
+				rf.changeStateTo(FOLLOWER)
+			} else {
+				// 如果snapshot同步成功，更新nextIndex和matchIndex
+				// 注意RPC中途logs可能会因为调用了Start()等发生变化，所以需要用发送RPC时的args.LastIncludedIndex，
+				// 而不是直接用rf.logs.getLogLength()之类的，以保证调用前后的一致性
+				rf.nextIndex[i] = args.LastIncludedIndex + 1
+				rf.matchIndex[i] = args.LastIncludedIndex
+				rf.updateCommitIndex()
+			}
+		} else {
+			// 如果nextIndex[i] 在logs里面，发送AppendEntries给follower，
+			// 同步后续的log
+			entries := make([]*LogEntry, 0)
+			if rf.nextIndex[i] < rf.logs.getLogLength() {
+				entries = append(entries, rf.logs.getLogsFrom(rf.nextIndex[i])...)
+			}
+			prevLog := rf.logs.getLog(rf.nextIndex[i] - 1)
+			args := &AppendEntriesArgs{
+				LeaderId:     rf.me,
+				Term:         rf.currentTerm,
+				LeaderCommit: rf.commitIndex,
+				Entries:      entries,
+				PrevLogTerm:  prevLog.Term,
+				PrevLogIndex: prevLog.Index,
+			}
+
+			rf.unlockState()
+
+			reply := &AppendEntriesReply{}
+
+			DPrintf("[Raft %d {%d}] sendAppendEntries to %d", rf.me, rf.currentTerm, i)
+			ok := rf.sendAppendEntries(i, args, reply)
+			if !ok {
+				continue
+			}
+
+			rf.lockState()
+			// important bug
+			// 过时的AppendEntries RPC，不用理会
+			if !rf.stateUnchanged(LEADER, args.Term) {
+				rf.unlockState()
+				continue
+			}
+
+			if reply.Success {
+				// 如果同步成功，更新nextIndex和matchIndex
+				// 注意RPC中途logs可能会因为调用了Start()等发生变化，所以需要用len(args.Entries)，
+				// 而不是直接用rf.logs.getLogLength()之类的，以保证调用前后的一致性
+				rf.nextIndex[i] = prevLog.Index + len(args.Entries) + 1
+				rf.matchIndex[i] = rf.nextIndex[i] - 1
+				// matchIndex[i]更新，可能导致commitIndex更新
+				rf.updateCommitIndex()
+			} else if reply.Term > args.Term {
+				// 如果Term更大，变成FOLLOWER
+				rf.currentTerm = reply.Term
+				rf.voteFor = -1
+				rf.changeStateTo(FOLLOWER)
+			} else {
+				// 简化，简化，简化。。。直接回退到Follower指出的悲观估计位置
+				// 悲观估计位置是ConflictTerm的第一个位置，下一次传的PrevLogTerm必然更小，
+				// 然后Follower就可以在更前一个Term中定位悲观估计位置，work！
+				rf.nextIndex[i] = reply.XIndex
+			}
+		}
+
+		rf.unlockState()
+	}
+}
+
+// 必须带锁rf.mu访问，非阻塞
 func (rf *Raft) heartBeat() {
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
 
-		go func(i int) {
-			rf.lockState()
-			if rf.state != LEADER {
-				rf.unlockState()
-				return
-			}
+		// 通知所有心跳线程
+		rf.heartBeatConds[i].Signal()
+	}
 
-			if rf.nextIndex[i] <= rf.logs.getLastIncludedIndex() {
-				// 如果nextIndex[i] 在snapshot里面，发送InstallSnapshot给follower，
-				// 先把snapshot同步过去
-				args := &InstallSnapshotArgs{
-					LeaderId:          rf.me,
-					Term:              rf.currentTerm,
-					LastIncludedIndex: rf.logs.getLastIncludedIndex(),
-					LastIncludedTerm:  rf.logs.getLastIncludedTerm(),
-					Data:              rf.snapshot,
-				}
-				rf.unlockState()
+}
 
-				reply := &InstallSnapshotReply{}
-				DPrintf("[Raft %d {%d}] sendInstallSnapshot to %d", rf.me, rf.currentTerm, i)
-				ok := rf.sendInstallSnapshot(i, args, reply)
-				if !ok {
-					return
-				}
+func (rf *Raft) heartBeatHandler() {
+	// 启动心跳线程
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
 
-				rf.lockState()
-				defer rf.unlockState()
-				// important bug
-				// 过时的InstallSnapshot RPC，不用理会
-				if !rf.stateUnchanged(LEADER, args.Term) {
-					return
-				}
+		go rf.heartBeatForPeer(i)
+	}
 
-				if reply.Term > args.Term {
-					// 如果Term更大，变成FOLLOWER
-					rf.currentTerm = reply.Term
-					rf.voteFor = -1
-					rf.changeStateTo(FOLLOWER)
-				} else {
-					// 如果snapshot同步成功，更新nextIndex和matchIndex
-					rf.nextIndex[i] = rf.logs.getLastIncludedIndex() + 1
-					rf.matchIndex[i] = rf.logs.getLastIncludedIndex()
-				}
-			} else {
-				// 如果nextIndex[i] 在logs里面，发送AppendEntries给follower，
-				// 同步后续的log
-				entries := make([]*LogEntry, 0)
-				if rf.nextIndex[i] < rf.logs.getLogLength() {
-					entries = append(entries, rf.logs.getLogsFrom(rf.nextIndex[i])...)
-				}
-				prevLog := rf.logs.getLog(rf.nextIndex[i] - 1)
-				args := &AppendEntriesArgs{
-					LeaderId:     rf.me,
-					Term:         rf.currentTerm,
-					LeaderCommit: rf.commitIndex,
-					Entries:      entries,
-					PrevLogTerm:  prevLog.Term,
-					PrevLogIndex: prevLog.Index,
-				}
-				rf.unlockState()
+	for !rf.killed() {
+		rf.lockState()
+		for rf.state != LEADER {
+			rf.stateCond.Wait()
+		}
 
-				reply := &AppendEntriesReply{}
-				DPrintf("[Raft %d {%d}] sendAppendEntries to %d", rf.me, rf.currentTerm, i)
-				ok := rf.sendAppendEntries(i, args, reply)
-				if !ok {
-					return
-				}
+		rf.heartBeat()
 
-				rf.lockState()
-				defer rf.unlockState()
-				// important bug
-				// 过时的AppendEntries RPC，不用理会
-				if !rf.stateUnchanged(LEADER, args.Term) {
-					return
-				}
+		rf.unlockState()
 
-				if reply.Success {
-					// 如果同步成功，更新nextIndex和matchIndex
-					rf.matchIndex[i] = prevLog.Index + len(args.Entries)
-					rf.nextIndex[i] = rf.matchIndex[i] + 1
-					// matchIndex[i]更新，可能导致commitIndex更新
-					rf.updateCommitIndex()
-				} else if reply.Term > args.Term {
-					// 如果Term更大，变成FOLLOWER
-					rf.currentTerm = reply.Term
-					rf.voteFor = -1
-					rf.changeStateTo(FOLLOWER)
-				} else {
-					// 失败时，根据reply的信息做快速回退
-					if reply.XTerm == -1 {
-						// 如果没有冲突的Term，follower的logs太短了，
-						// reply.XIndex指明了follower logs的末尾，同步后面的logs
-						rf.nextIndex[i] = reply.XIndex
-					} else {
-						// 如果有冲突的Term，冲突的位置应该在这个XTerm的某个记录上，
-						// reply.XIndex是冲突Term的第一个Index，这是悲观估计，需要同步进可能多。
-						// 悲观估计有时会导致很多多余的logs同步，尤其是在同一个Term中运行了很久的Leader的记录中发生了冲突时。
-						// 因此这里需要找到XTerm的最后一个Index，乐观估计。如果冲突位置在乐观估计之前，就保守地一格一格往前走。
-						nextIndex := rf.logs.getLastIncludedIndex()
-						for index := rf.logs.getLogLength() - 1; index > rf.logs.getLastIncludedIndex(); index-- {
-							if rf.logs.getLog(index).Term == reply.XTerm {
-								nextIndex = index
-								break
-							}
-						}
-						// a little trick，乐观估计快速回退和保守回退法取最小，其实就是上述效果：先乐观快回再保守回退
-						rf.nextIndex[i] = min(rf.nextIndex[i]-1, nextIndex)
-					}
-				}
-			}
-		}(i)
+		time.Sleep(rf.heartBeatDuration)
 	}
 }
 
@@ -229,25 +299,11 @@ func (rf *Raft) updateCommitIndex() {
 				}
 			}
 			if matchedNum > len(rf.peers)/2 {
-				rf.commitIndex = i
+				// rf.commitIndex = i
+				rf.setCommitIndexSafe(i)
 				// 应用到状态机等后续操作
 				break
 			}
 		}
-	}
-}
-
-func (rf *Raft) heartBeatHandler() {
-	for !rf.killed() {
-		rf.lockState()
-		if rf.state != LEADER {
-			rf.unlockState()
-			continue
-		}
-		rf.unlockState()
-
-		rf.heartBeat()
-
-		time.Sleep(rf.heartBeatDuration)
 	}
 }

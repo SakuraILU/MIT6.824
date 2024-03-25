@@ -19,7 +19,6 @@ package raft
 
 import (
 	"bytes"
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -44,6 +43,7 @@ type ApplyMsg struct {
 	// Log Command 2B
 	CommandValid bool
 	Command      interface{}
+	CommandTerm  int
 	CommandIndex int
 	// Snapshot 2D
 	SnapshotValid bool
@@ -64,21 +64,22 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 	// 2A
-	state       State // 此节点的当前状态
-	currentTerm int   // 此节点的任期
-	voteFor     int   // 在当前任期内，此节点将选票投给了谁。
+	state             State         // 此节点的当前状态
+	currentTerm       int           // 此节点的任期
+	voteFor           int           // 在当前任期内，此节点将选票投给了谁。
+	stateCond         *sync.Cond    // 用于等待选举的条件变量
+	sendRPCTimeout    time.Duration // 发送AppendEntries RPC的超时时间
+	electionTime      time.Time     // 触发选举的时刻
+	heartBeatDuration time.Duration // 心跳周期
+	heartBeatConds    []*sync.Cond  // 用于等待心跳的条件变量
 	// 2B
 	logs        *Logs         // 日志
-	snapshot    []byte        // 快照
 	commitIndex int           // 已经提交的日志的Index
 	lastApplied int           // 已经应用的日志的Index
 	nextIndex   []int         // 每个节点下一条要发送的日志的Index
 	matchIndex  []int         // 每个节点已经复制的日志的Index
 	applyCh     chan ApplyMsg // 向应用Commit日志的通道
-
-	// timer
-	electionTime      time.Time     // 触发选举的时刻
-	heartBeatDuration time.Duration // 心跳周期
+	applyCond   *sync.Cond    // 用于等待应用日志的条件变量
 }
 
 // return currentTerm and whether this server
@@ -108,7 +109,7 @@ func (rf *Raft) persist() {
 	encoder.Encode(rf.logs)
 
 	data := buffer.Bytes()
-	rf.persister.SaveStateAndSnapshot(data, rf.snapshot)
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
@@ -166,6 +167,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.matchIndex[rf.me] = rf.logs.getLogLength() - 1
 	rf.nextIndex[rf.me] = rf.logs.getLogLength()
 
+	rf.heartBeat()
+
 	return index, term, true
 }
 
@@ -173,9 +176,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // have more recent info since it communicate the snapshot on applyCh.
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 	// Your code here (2D).
-	rf.lockState()
-	defer rf.unlockState()
-	DPrintf("[Raft %d {%d}] CondInstallSnapshot from %d", rf.me, rf.currentTerm, lastIncludedIndex)
 	return true
 }
 
@@ -190,11 +190,17 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	if index <= rf.logs.getLastIncludedIndex() {
 		return
 	} else if index >= rf.logs.getLogLength() {
-		panic(fmt.Sprintf("[Raft %d] snapshot too much at %d, total length is %d", rf.me, index, rf.logs.getLogLength()))
+		return
+	} else {
+		rf.logs.truncLogBefore(index)
 	}
-
-	rf.logs.truncLogBefore(index)
-	rf.snapshot = snapshot
+	rf.persister.SaveStateAndSnapshot(rf.statePersistData(), snapshot)
+	// important bug, find the bug in updateCommitIndex: invalid getLog(i)
+	// rf.lastApplied = max(rf.logs.getLastIncludedIndex(), rf.lastApplied)
+	// rf.commitIndex = max(rf.logs.getLastIncludedIndex(), rf.commitIndex)
+	// rf.setLastAppliedSafe(rf.logs.getLastIncludedIndex())
+	rf.setCommitIndexSafe(rf.logs.getLastIncludedIndex())
+	rf.setLastAppliedSafe(rf.logs.getLastIncludedIndex())
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -236,14 +242,32 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = FOLLOWER
 	rf.currentTerm = 0
 	rf.voteFor = -1
-	rf.heartBeatDuration = time.Duration(heartBeatDuration) * time.Millisecond
+	rf.stateCond = sync.NewCond(&rf.mu)
+	rf.heartBeatDuration = heartBeatDuration
+	rf.sendRPCTimeout = 200 * time.Millisecond
+	rf.heartBeatConds = make([]*sync.Cond, len(rf.peers))
+	for i := range rf.peers {
+		rf.heartBeatConds[i] = sync.NewCond(&rf.mu)
+	}
 	rf.logs = MakeLogs(0, 0)
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.applyCh = applyCh
+	rf.applyCond = sync.NewCond(&rf.mu)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-	rf.snapshot = persister.ReadSnapshot()
+	if rf.logs.getLastIncludedIndex() != 0 {
+		// send snapshot to applyCh
+		applyMsg := ApplyMsg{
+			SnapshotValid: true,
+			Snapshot:      rf.persister.ReadSnapshot(),
+			SnapshotTerm:  rf.logs.getLastIncludedTerm(),
+			SnapshotIndex: rf.logs.getLastIncludedIndex(),
+		}
+		go func() {
+			rf.applyCh <- applyMsg
+		}()
+	}
 	rf.commitIndex = rf.logs.getLastIncludedIndex()
 	rf.lastApplied = rf.logs.getLastIncludedIndex()
 

@@ -29,6 +29,7 @@ func (rf *Raft) changeStateTo(state State) {
 	case FOLLOWER:
 		{
 			if state == FOLLOWER {
+				rf.voteFor = -1
 				// rf.resetElectionTimer()
 			} else if state == CANDIDATE {
 				rf.currentTerm++
@@ -42,6 +43,7 @@ func (rf *Raft) changeStateTo(state State) {
 	case CANDIDATE:
 		{
 			if state == FOLLOWER {
+				rf.voteFor = -1
 				// rf.resetElectionTimer()
 			} else if state == CANDIDATE {
 				rf.currentTerm++
@@ -63,6 +65,7 @@ func (rf *Raft) changeStateTo(state State) {
 	case LEADER:
 		{
 			if state == FOLLOWER {
+				rf.voteFor = -1
 				// rf.resetElectionTimer()
 			} else {
 				panic(fmt.Sprintf("Invalid state change from %v to %v", rf.state, state))
@@ -71,4 +74,6 @@ func (rf *Raft) changeStateTo(state State) {
 		}
 	}
 	rf.state = state
+
+	rf.stateCond.Broadcast()
 }

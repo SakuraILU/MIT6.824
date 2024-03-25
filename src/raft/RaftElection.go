@@ -115,9 +115,8 @@ func (rf *Raft) electionHandler() {
 		time.Sleep(10 * time.Millisecond)
 
 		rf.lockState()
-		if rf.state == LEADER {
-			rf.unlockState()
-			continue
+		for rf.state == LEADER {
+			rf.stateCond.Wait()
 		}
 
 		if time.Now().After(rf.electionTime) {
@@ -210,8 +209,8 @@ func (rf *Raft) election() {
 
 		if votesGrantedNum > len(rf.peers)/2 {
 			rf.changeStateTo(LEADER)
-			rf.unlockState()
 			rf.heartBeat()
+			rf.unlockState()
 			return
 		} else if votesCnt >= len(rf.peers) {
 			// 选举失败，直接返回。等待后续超时后再次进行选举

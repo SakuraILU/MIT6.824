@@ -3,7 +3,6 @@ package kvraft
 import (
 	"crypto/rand"
 	"math/big"
-	"time"
 
 	"mit6.824/src/labrpc"
 )
@@ -53,11 +52,9 @@ func (ck *Clerk) Get(key string) string {
 		leader := ck.servers[ck.leaderId]
 
 		args := &GetArgs{
-			Key: key,
-			OpId: OpId{
-				ClerkId: ck.clerkId,
-				SeqId:   ck.seqId,
-			},
+			Key:     key,
+			ClerkId: ck.clerkId,
+			SeqId:   ck.seqId,
 		}
 		reply := &GetReply{}
 
@@ -65,7 +62,6 @@ func (ck *Clerk) Get(key string) string {
 		ok := leader.Call("KVServer.Get", args, reply)
 		if !ok || reply.Err == ErrWrongLeader {
 			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
-			time.Sleep(50 * time.Millisecond)
 			continue
 		}
 
@@ -96,13 +92,11 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		leader := ck.servers[ck.leaderId]
 
 		args := &PutAppendArgs{
-			Key:   key,
-			Value: value,
-			Op:    op,
-			OpId: OpId{
-				ClerkId: ck.clerkId,
-				SeqId:   ck.seqId,
-			},
+			Key:     key,
+			Value:   value,
+			Op:      op,
+			ClerkId: ck.clerkId,
+			SeqId:   ck.seqId,
 		}
 		reply := &PutAppendReply{}
 
@@ -110,7 +104,6 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		ok := leader.Call("KVServer.PutAppend", args, reply)
 		if !ok || reply.Err == ErrWrongLeader {
 			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
-			time.Sleep(50 * time.Millisecond)
 			continue
 		}
 
